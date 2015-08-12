@@ -1,4 +1,9 @@
-package nettyexample;
+package nettyexample.server;
+
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
@@ -22,16 +27,12 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpHeaders;
+import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpRequestDecoder;
 import io.netty.handler.codec.http.HttpResponseEncoder;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpVersion;
-
-import java.net.InetSocketAddress;
-import java.nio.charset.StandardCharsets;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
 
 public class WebServer {
     private static final CharSequence TYPE_PLAIN = HttpHeaders.newEntity("text/plain; charset=UTF-8");
@@ -41,29 +42,29 @@ public class WebServer {
     private static final CharSequence DATE_ENTITY = HttpHeaders.newEntity(HttpHeaders.Names.DATE);
     private static final CharSequence CONTENT_LENGTH_ENTITY = HttpHeaders.newEntity(HttpHeaders.Names.CONTENT_LENGTH);
     private static final CharSequence SERVER_ENTITY = HttpHeaders.newEntity(HttpHeaders.Names.SERVER);
-    private final int port;
+    private final RouteTable routeTable;
+    private int port;
 
-
-    /**
-     * Creates a new web server.
-     *
-     * @param port
-     */
-    public WebServer(final int port) {
-        this.port = port;
+    public WebServer() {
+        this.routeTable = new RouteTable();
+        this.port = 4567;
     }
 
+    public WebServer get(final String path, final Handler handler) {
+        this.routeTable.addRoute(new Route(HttpMethod.GET, path, handler));
+        return this;
+    }
 
-    public void run() throws Exception {
+    public void start() throws Exception {
         if (Epoll.isAvailable()) {
-            doRun(new EpollEventLoopGroup(), EpollServerSocketChannel.class);
+            start(new EpollEventLoopGroup(), EpollServerSocketChannel.class);
         } else {
-            doRun(new NioEventLoopGroup(), NioServerSocketChannel.class);
+            start(new NioEventLoopGroup(), NioServerSocketChannel.class);
         }
     }
 
 
-    private void doRun(
+    private void start(
             final EventLoopGroup loupGroup,
             final Class<? extends ServerChannel> serverChannelClass)
                     throws InterruptedException {
@@ -74,7 +75,7 @@ public class WebServer {
             final ServerBootstrap b = new ServerBootstrap();
             b.option(ChannelOption.SO_BACKLOG, 1024);
             b.option(ChannelOption.SO_REUSEADDR, true);
-            b.group(loupGroup).channel(serverChannelClass).childHandler(new Initializer());
+            b.group(loupGroup).channel(serverChannelClass).childHandler(new WebServerInitializer());
             b.option(ChannelOption.MAX_MESSAGES_PER_READ, Integer.MAX_VALUE);
             b.childOption(ChannelOption.ALLOCATOR, new PooledByteBufAllocator(true));
             b.childOption(ChannelOption.SO_REUSEADDR, true);
@@ -92,7 +93,7 @@ public class WebServer {
     /**
      * The Initializer class initializes the HTTP channel.
      */
-    private static class Initializer extends ChannelInitializer<SocketChannel> {
+    private class WebServerInitializer extends ChannelInitializer<SocketChannel> {
 
         /**
          * Initializes the channel pipeline with the HTTP response handlers.
@@ -104,7 +105,7 @@ public class WebServer {
             final ChannelPipeline p = ch.pipeline();
             p.addLast("encoder", new HttpResponseEncoder());
             p.addLast("decoder", new HttpRequestDecoder(4096, 8192, 8192, false));
-            p.addLast("handler", new Handler());
+            p.addLast("handler", new WebServerHandler());
         }
     }
 
@@ -112,7 +113,7 @@ public class WebServer {
     /**
      * The Handler class handles all inbound channel messages.
      */
-    private static class Handler extends SimpleChannelInboundHandler<Object> {
+    private class WebServerHandler extends SimpleChannelInboundHandler<Object> {
 
         @Override
         public void channelRead0(final ChannelHandlerContext ctx, final Object msg) {
@@ -121,63 +122,19 @@ public class WebServer {
             }
 
             final HttpRequest request = (HttpRequest) msg;
+            final HttpMethod method = request.getMethod();
             final String uri = request.getUri();
 
-            if (uri.equals("/404")) {
-                writeResponse(ctx, request, HttpResponseStatus.NOT_FOUND, TYPE_PLAIN, "not found what what");
-            } else if (uri.startsWith("/json")) {
-                writeResponse(ctx, request, HttpResponseStatus.OK, TYPE_JSON, "{\"ok\":true,\"test\":{\"foo\":\"bar\"}}");
+            final Route route = WebServer.this.routeTable.findRoute(method, uri);
+            if (route != null) {
+                try {
+                    final Object obj = route.getHandler().handle(null, null);
+                    writeResponse(ctx, request, HttpResponseStatus.OK, TYPE_PLAIN, obj.toString());
+                } catch (Exception e) {
+                    writeResponse(ctx, request, HttpResponseStatus.INTERNAL_SERVER_ERROR, TYPE_PLAIN, "Error");
+                }
             } else {
-                writeResponse(ctx, request, HttpResponseStatus.OK, TYPE_PLAIN, "You requested: " + uri);
-            }
-        }
-
-        private static void writeResponse(
-                ChannelHandlerContext ctx,
-                HttpRequest request,
-                HttpResponseStatus status,
-                CharSequence contentType,
-                String content) {
-
-            final byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
-            final ByteBuf entity = Unpooled.wrappedBuffer(bytes);
-            final CharSequence length = HttpHeaders.newEntity(Integer.toString(bytes.length));
-            writeResponse(ctx, request, status, entity, contentType, length);
-        }
-
-        private static void writeResponse(
-                ChannelHandlerContext ctx,
-                HttpRequest request,
-                HttpResponseStatus status,
-                ByteBuf buf,
-                CharSequence contentType,
-                CharSequence contentLength) {
-
-            // Decide whether to close the connection or not.
-            final boolean keepAlive = HttpHeaders.isKeepAlive(request);
-
-            // Build the response object.
-            final FullHttpResponse response = new DefaultFullHttpResponse(
-                    HttpVersion.HTTP_1_1,
-                    status,
-                    buf,
-                    false);
-
-            final ZonedDateTime dateTime = ZonedDateTime.now();
-            final DateTimeFormatter formatter = DateTimeFormatter.RFC_1123_DATE_TIME;
-            final CharSequence date = HttpHeaders.newEntity(dateTime.format(formatter));
-
-            final HttpHeaders headers = response.headers();
-            headers.set(CONTENT_TYPE_ENTITY, contentType);
-            headers.set(SERVER_ENTITY, SERVER_NAME);
-            headers.set(DATE_ENTITY, date);
-            headers.set(CONTENT_LENGTH_ENTITY, contentLength);
-
-            // Close the non-keep-alive connection after the write operation is done.
-            if (!keepAlive) {
-                ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
-            } else {
-                ctx.writeAndFlush(response, ctx.voidPromise());
+                writeResponse(ctx, request, HttpResponseStatus.NOT_FOUND, TYPE_PLAIN, "Not Found");
             }
         }
 
@@ -189,6 +146,57 @@ public class WebServer {
         @Override
         public void channelReadComplete(ChannelHandlerContext ctx) {
             ctx.flush();
+        }
+    }
+
+
+    private static void writeResponse(
+            ChannelHandlerContext ctx,
+            HttpRequest request,
+            HttpResponseStatus status,
+            CharSequence contentType,
+            String content) {
+
+        final byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+        final ByteBuf entity = Unpooled.wrappedBuffer(bytes);
+        final CharSequence length = HttpHeaders.newEntity(Integer.toString(bytes.length));
+        writeResponse(ctx, request, status, entity, contentType, length);
+    }
+
+
+    private static void writeResponse(
+            ChannelHandlerContext ctx,
+            HttpRequest request,
+            HttpResponseStatus status,
+            ByteBuf buf,
+            CharSequence contentType,
+            CharSequence contentLength) {
+
+        // Decide whether to close the connection or not.
+        final boolean keepAlive = HttpHeaders.isKeepAlive(request);
+
+        // Build the response object.
+        final FullHttpResponse response = new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1,
+                status,
+                buf,
+                false);
+
+        final ZonedDateTime dateTime = ZonedDateTime.now();
+        final DateTimeFormatter formatter = DateTimeFormatter.RFC_1123_DATE_TIME;
+        final CharSequence date = HttpHeaders.newEntity(dateTime.format(formatter));
+
+        final HttpHeaders headers = response.headers();
+        headers.set(CONTENT_TYPE_ENTITY, contentType);
+        headers.set(SERVER_ENTITY, SERVER_NAME);
+        headers.set(DATE_ENTITY, date);
+        headers.set(CONTENT_LENGTH_ENTITY, contentLength);
+
+        // Close the non-keep-alive connection after the write operation is done.
+        if (!keepAlive) {
+            ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
+        } else {
+            ctx.writeAndFlush(response, ctx.voidPromise());
         }
     }
 }
