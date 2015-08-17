@@ -25,9 +25,13 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
+import io.netty.handler.codec.http.DefaultHttpHeaders;
+import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
-import io.netty.handler.codec.http.HttpHeaders;
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpHeaderUtil;
 import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpRequestDecoder;
 import io.netty.handler.codec.http.HttpResponseEncoder;
@@ -35,26 +39,53 @@ import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpVersion;
 
 public class WebServer {
-    private static final CharSequence TYPE_PLAIN = HttpHeaders.newEntity("text/plain; charset=UTF-8");
-    private static final CharSequence TYPE_JSON = HttpHeaders.newEntity("application/json; charset=UTF-8");
-    private static final CharSequence SERVER_NAME = HttpHeaders.newEntity("Netty");
-    private static final CharSequence CONTENT_TYPE_ENTITY = HttpHeaders.newEntity(HttpHeaders.Names.CONTENT_TYPE);
-    private static final CharSequence DATE_ENTITY = HttpHeaders.newEntity(HttpHeaders.Names.DATE);
-    private static final CharSequence CONTENT_LENGTH_ENTITY = HttpHeaders.newEntity(HttpHeaders.Names.CONTENT_LENGTH);
-    private static final CharSequence SERVER_ENTITY = HttpHeaders.newEntity(HttpHeaders.Names.SERVER);
+    public static final String TYPE_PLAIN = "text/plain; charset=UTF-8";
+    public static final String TYPE_JSON = "application/json; charset=UTF-8";
+    public static final String SERVER_NAME = "Netty";
     private final RouteTable routeTable;
-    private int port;
+    private final int port;
 
+
+    /**
+     * Creates a new WebServer.
+     */
     public WebServer() {
         this.routeTable = new RouteTable();
         this.port = 4567;
     }
 
+
+    /**
+     * Adds a GET route.
+     *
+     * @param path The URL path.
+     * @param handler The request handler.
+     * @return This WebServer.
+     */
     public WebServer get(final String path, final Handler handler) {
         this.routeTable.addRoute(new Route(HttpMethod.GET, path, handler));
         return this;
     }
 
+
+    /**
+     * Adds a POST route.
+     *
+     * @param path The URL path.
+     * @param handler The request handler.
+     * @return This WebServer.
+     */
+    public WebServer post(final String path, final Handler handler) {
+        this.routeTable.addRoute(new Route(HttpMethod.POST, path, handler));
+        return this;
+    }
+
+
+    /**
+     * Starts the web server.
+     *
+     * @throws Exception
+     */
     public void start() throws Exception {
         if (Epoll.isAvailable()) {
             start(new EpollEventLoopGroup(), EpollServerSocketChannel.class);
@@ -103,8 +134,9 @@ public class WebServer {
         @Override
         public void initChannel(SocketChannel ch) throws Exception {
             final ChannelPipeline p = ch.pipeline();
-            p.addLast("encoder", new HttpResponseEncoder());
             p.addLast("decoder", new HttpRequestDecoder(4096, 8192, 8192, false));
+            p.addLast("aggregator", new HttpObjectAggregator(100 * 1024 * 1024));
+            p.addLast("encoder", new HttpResponseEncoder());
             p.addLast("handler", new WebServerHandler());
         }
     }
@@ -116,25 +148,35 @@ public class WebServer {
     private class WebServerHandler extends SimpleChannelInboundHandler<Object> {
 
         @Override
-        public void channelRead0(final ChannelHandlerContext ctx, final Object msg) {
-            if (!(msg instanceof HttpRequest)) {
+        public void messageReceived(final ChannelHandlerContext ctx, final Object msg) {
+            if (!(msg instanceof FullHttpRequest)) {
                 return;
             }
 
-            final HttpRequest request = (HttpRequest) msg;
-            final HttpMethod method = request.getMethod();
-            final String uri = request.getUri();
+            final FullHttpRequest request = (FullHttpRequest) msg;
+
+            if (HttpHeaderUtil.is100ContinueExpected(request)) {
+                send100Continue(ctx);
+            }
+
+            final HttpMethod method = request.method();
+            final String uri = request.uri();
 
             final Route route = WebServer.this.routeTable.findRoute(method, uri);
-            if (route != null) {
-                try {
-                    final Object obj = route.getHandler().handle(null, null);
-                    writeResponse(ctx, request, HttpResponseStatus.OK, TYPE_PLAIN, obj.toString());
-                } catch (Exception e) {
-                    writeResponse(ctx, request, HttpResponseStatus.INTERNAL_SERVER_ERROR, TYPE_PLAIN, "Error");
-                }
-            } else {
-                writeResponse(ctx, request, HttpResponseStatus.NOT_FOUND, TYPE_PLAIN, "Not Found");
+            if (route == null) {
+                writeNotFound(ctx, request);
+                return;
+            }
+
+            try {
+                final Request requestWrapper = new Request(request);
+                final Object obj = route.getHandler().handle(requestWrapper, null);
+                final String content = obj == null ? "" : obj.toString();
+                writeResponse(ctx, request, HttpResponseStatus.OK, TYPE_PLAIN, content);
+            } catch (final Exception ex) {
+                System.out.println(ex);
+                ex.printStackTrace();
+                writeInternalServerError(ctx, request);
             }
         }
 
@@ -150,6 +192,22 @@ public class WebServer {
     }
 
 
+    private static void writeNotFound(
+            final ChannelHandlerContext ctx,
+            final HttpRequest request) {
+
+        writeResponse(ctx, request, HttpResponseStatus.NOT_FOUND, TYPE_PLAIN, "Not Found");
+    }
+
+
+    private static void writeInternalServerError(
+            final ChannelHandlerContext ctx,
+            final HttpRequest request) {
+
+        writeResponse(ctx, request, HttpResponseStatus.INTERNAL_SERVER_ERROR, TYPE_PLAIN, "Error");
+    }
+
+
     private static void writeResponse(
             ChannelHandlerContext ctx,
             HttpRequest request,
@@ -159,8 +217,7 @@ public class WebServer {
 
         final byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
         final ByteBuf entity = Unpooled.wrappedBuffer(bytes);
-        final CharSequence length = HttpHeaders.newEntity(Integer.toString(bytes.length));
-        writeResponse(ctx, request, status, entity, contentType, length);
+        writeResponse(ctx, request, status, entity, contentType, bytes.length);
     }
 
 
@@ -170,10 +227,10 @@ public class WebServer {
             HttpResponseStatus status,
             ByteBuf buf,
             CharSequence contentType,
-            CharSequence contentLength) {
+            int contentLength) {
 
         // Decide whether to close the connection or not.
-        final boolean keepAlive = HttpHeaders.isKeepAlive(request);
+        final boolean keepAlive = HttpHeaderUtil.isKeepAlive(request);
 
         // Build the response object.
         final FullHttpResponse response = new DefaultFullHttpResponse(
@@ -184,13 +241,12 @@ public class WebServer {
 
         final ZonedDateTime dateTime = ZonedDateTime.now();
         final DateTimeFormatter formatter = DateTimeFormatter.RFC_1123_DATE_TIME;
-        final CharSequence date = HttpHeaders.newEntity(dateTime.format(formatter));
 
-        final HttpHeaders headers = response.headers();
-        headers.set(CONTENT_TYPE_ENTITY, contentType);
-        headers.set(SERVER_ENTITY, SERVER_NAME);
-        headers.set(DATE_ENTITY, date);
-        headers.set(CONTENT_LENGTH_ENTITY, contentLength);
+        final DefaultHttpHeaders headers = (DefaultHttpHeaders) response.headers();
+        headers.set(HttpHeaderNames.SERVER, SERVER_NAME);
+        headers.set(HttpHeaderNames.DATE, dateTime.format(formatter));
+        headers.set(HttpHeaderNames.CONTENT_TYPE, contentType);
+        headers.set(HttpHeaderNames.CONTENT_LENGTH, Integer.toString(contentLength));
 
         // Close the non-keep-alive connection after the write operation is done.
         if (!keepAlive) {
@@ -198,5 +254,17 @@ public class WebServer {
         } else {
             ctx.writeAndFlush(response, ctx.voidPromise());
         }
+    }
+
+
+    /**
+     * Writes a 100 Continue response.
+     *
+     * @param ctx The HTTP handler context.
+     */
+    private static void send100Continue(final ChannelHandlerContext ctx) {
+        ctx.write(new DefaultFullHttpResponse(
+                HttpVersion.HTTP_1_1,
+                HttpResponseStatus.CONTINUE));
     }
 }
