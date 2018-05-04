@@ -26,7 +26,7 @@ public class App {
 
 ```groovy
 
-import nettyexample.server.*;
+import nettyexample.server.*
 
 new WebServer()
     // Simple GET request
@@ -34,9 +34,9 @@ new WebServer()
 
     // Simple POST request
     .post("/hello", (request, response) -> {
-          return "Hello world: " + request.body();
+          return "Hello world: " + request.body()
     })
 
     // Start the server
-    .start();
+    .start()
 ```
