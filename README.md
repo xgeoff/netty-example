@@ -1,7 +1,7 @@
 # netty-example
 Example web server using Netty, inspired by [Spark](https://github.com/perwendel/spark)
 
-Example
+Java Example
 -------
 ```java
 
@@ -23,7 +23,8 @@ public class App {
 }
 ```
 
-
+Groovy Example
+-------
 ```groovy
 
 import nettyexample.server.*
